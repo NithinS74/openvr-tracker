@@ -1,7 +1,7 @@
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BNO055.h>
-#include <SparkFun_I2C_Mux_Arduino_Library.h>
+#include "TCA9548.h"
 #include <WiFi.h>
 #include <WiFiUdp.h>
 
@@ -9,7 +9,7 @@
 #include "wifi_secrets.h"
 
 // --- HARDWARE CONFIGURATION ---
-QWIICMUX myMux;
+TCA9548 myMux(0x70);
 const uint8_t MAX_TRACKERS = 5;
 Adafruit_BNO055 bno[MAX_TRACKERS] = {
     Adafruit_BNO055(55, 0x28, &Wire),
@@ -52,7 +52,7 @@ void setup() {
     Wire.begin(21, 22); 
 
     // Initialize Multiplexer
-    if (myMux.begin(0x70, Wire) == false) {
+    if (myMux.begin() == false) {
         Serial.println("PCA9548a Mux not detected. Check wiring (SDA->21, SCL->22).");
         while(1);
     }
@@ -60,7 +60,7 @@ void setup() {
 
     // Hardware Discovery
     for (uint8_t i = 0; i < MAX_TRACKERS; i++) {
-        myMux.setPort(i);
+        myMux.selectChannel(i);
         delay(10); // Settle time
         
         Serial.printf("Checking channel %d... ", i);
@@ -179,7 +179,7 @@ void sendIMUData() {
     for (uint8_t i = 0; i < active_tracker_count; i++) {
         uint8_t id = active_tracker_ids[i];
         
-        myMux.setPort(id); // Rapidly select the I2C channel for this sensor
+        myMux.selectChannel(id); // Rapidly select the I2C channel for this sensor
         
         imu::Quaternion quat = bno[id].getQuat();
         imu::Vector<3> linAcc = bno[id].getVector(Adafruit_BNO055::VECTOR_LINEARACCEL);
