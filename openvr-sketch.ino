@@ -1,50 +1,82 @@
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BNO055.h>
+#include <SparkFun_I2C_Mux_Arduino_Library.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
 
 #include "common.h"
 #include "wifi_secrets.h"
 
-// --- TRACKER CONFIGURATION ---
-const uint8_t DEVICE_ID = 1;
-
 // --- HARDWARE CONFIGURATION ---
-// I2C Wiring for standard ESP32: SDA -> GPIO 21, SCL -> GPIO 22
-Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28, &Wire);
+QWIICMUX myMux;
+const uint8_t MAX_TRACKERS = 5;
+Adafruit_BNO055 bno[MAX_TRACKERS] = {
+    Adafruit_BNO055(55, 0x28, &Wire),
+    Adafruit_BNO055(55, 0x28, &Wire),
+    Adafruit_BNO055(55, 0x28, &Wire),
+    Adafruit_BNO055(55, 0x28, &Wire),
+    Adafruit_BNO055(55, 0x28, &Wire)
+};
+
+// Tracking active sensors
+uint8_t active_tracker_count = 0;
+uint8_t active_tracker_ids[8] = {0}; // Sized to 8 to match HandshakeReqPacket array size
+
+// --- NETWORKING STATE ---
+enum TrackerState {
+    STATE_DISCONNECTED,
+    STATE_HANDSHAKE,
+    STATE_STREAMING
+};
+TrackerState currentState = STATE_DISCONNECTED;
 
 WiFiUDP udp;
-unsigned long lastTime = 0;
+IPAddress pc_ip; // Dynamically acquired from PC Driver ACK
+bool is_ip_known = false;
+
+// Timing Variables
+unsigned long lastDataTime = 0;
+unsigned long lastHandshakeTime = 0;
+unsigned long lastHeartbeatTime = 0;
 const int INTERVAL_MS = 10; // ~100Hz
+const int HANDSHAKE_INTERVAL_MS = 1000; // 1Hz Broadcast
+const int HEARTBEAT_TIMEOUT_MS = 5000;  // 5 seconds connection timeout
 
 void setup() {
     Serial.begin(115200);
-    delay(1000); // Give serial monitor time to catch up
+    delay(1000);
 
-    Serial.println("\n\n--- VR Tracker Sender Starting (ESP32) ---");
-    Serial.printf("Tracker ID: %d\n", DEVICE_ID);
+    Serial.println("\n\n--- VR Multi-Tracker Sender Starting (ESP32) ---");
 
-    // 1. Initialize I2C Explicitly
-    // This ensures GPIO 21 and 22 are actually used.
     Wire.begin(21, 22); 
-    
-    Serial.print("Initializing BNO055... ");
-    if (!bno.begin()) {
-        Serial.println("FAILED!");
-        Serial.println("Check wiring: SDA->21, SCL->22, VCC->3.3V, GND->GND");
-        while (1); // Halt
+
+    // Initialize Multiplexer
+    if (myMux.begin(0x70, Wire) == false) {
+        Serial.println("PCA9548a Mux not detected. Check wiring (SDA->21, SCL->22).");
+        while(1);
     }
-    Serial.println("OK!");
-    delay(100);
+    Serial.println("PCA9548a Mux initialized.");
 
-    // 2. Crystal Selection (THE FIX)
-    // CRITICAL: Set to FALSE for generic/Chinese BNO055 modules. 
-    // Set to TRUE only for official Adafruit boards. 
-    // If this is wrong, you get (0,0,0,0) data.
-    bno.setExtCrystalUse(false); 
+    // Hardware Discovery
+    for (uint8_t i = 0; i < MAX_TRACKERS; i++) {
+        myMux.setPort(i);
+        delay(10); // Settle time
+        
+        Serial.printf("Checking channel %d... ", i);
+        if (bno[i].begin()) {
+            Serial.println("OK");
+            bno[i].setExtCrystalUse(false);
+            active_tracker_ids[active_tracker_count] = i;
+            active_tracker_count++;
+        } else {
+            Serial.println("FAILED");
+        }
+    }
+    
+    Serial.printf("Hardware Scan Complete. Found %d active trackers.\n", active_tracker_count);
 
-    // 3. Connect to Wi-Fi
+    // Connect to Wi-Fi
     Serial.print("Connecting to WiFi: ");
     Serial.println(WIFI_SSID);
 
@@ -54,55 +86,117 @@ void setup() {
         delay(500);
         Serial.print(".");
     }
-
     Serial.println("\nWiFi Connected!");
     Serial.print("ESP IP: ");
     Serial.println(WiFi.localIP());
 
-    // 4. Setup UDP
+    // We must bind the local port to receive UDP packets (ACKs and Heartbeats)
     udp.begin(TARGET_PORT);
-    Serial.printf("Targeting PC: %s:%d\n", PC_IP, TARGET_PORT);
+    
+    // Begin Handshake Protocol
+    currentState = STATE_HANDSHAKE;
 }
 
 void loop() {
-    // Non-blocking loop
-    if (millis() - lastTime >= INTERVAL_MS) {
-        lastTime = millis();
-        sendIMUData();
+    // 1. Process Incoming Commands from Driver
+    processIncomingPackets();
+
+    // 2. Handle State Logic
+    if (currentState == STATE_HANDSHAKE) {
+        if (millis() - lastHandshakeTime >= HANDSHAKE_INTERVAL_MS) {
+            lastHandshakeTime = millis();
+            sendHandshake();
+        }
+    } else if (currentState == STATE_STREAMING) {
+        // Check Heartbeat Timeout
+        if (millis() - lastHeartbeatTime > HEARTBEAT_TIMEOUT_MS) {
+            Serial.println("Heartbeat lost. Reverting to Handshake state.");
+            currentState = STATE_HANDSHAKE;
+            is_ip_known = false;
+        } else if (millis() - lastDataTime >= INTERVAL_MS) {
+            lastDataTime = millis();
+            sendIMUData();
+        }
     }
 }
 
-void sendIMUData() {
-    // 1. Read Quaternion
-    imu::Quaternion quat = bno.getQuat();
+void processIncomingPackets() {
+    int packetSize = udp.parsePacket();
+    if (packetSize) {
+        // Read the packet header byte
+        uint8_t packetType = udp.read();
+        
+        if (packetType == PACKET_HANDSHAKE_ACK && currentState == STATE_HANDSHAKE) {
+            // Packet is 2 bytes total. Second byte is status.
+            uint8_t status = udp.read();
+            if (status == 0) { // OK
+                pc_ip = udp.remoteIP();
+                is_ip_known = true;
+                currentState = STATE_STREAMING;
+                lastHeartbeatTime = millis(); // Reset heartbeat timer
+                Serial.print("Handshake ACK received. Locked onto PC IP: ");
+                Serial.println(pc_ip);
+            }
+        } else if (packetType == PACKET_HEARTBEAT && currentState == STATE_STREAMING) {
+            lastHeartbeatTime = millis(); // Refresh timeout
+        } else if (packetType == PACKET_HANDSHAKE_REQ && currentState == STATE_STREAMING) {
+            // "Reset Command" received from the driver (driver rebooted)
+            Serial.println("Driver requested a reset. Reverting to Handshake state.");
+            currentState = STATE_HANDSHAKE;
+            is_ip_known = false;
+        }
+        
+        // Discard any remaining bytes in this packet
+        udp.flush();
+    }
+}
+
+void sendHandshake() {
+    HandshakeReqPacket req;
+    req.packet_type = PACKET_HANDSHAKE_REQ;
+    req.active_tracker_count = active_tracker_count;
+    // Fill the array (defaulting unused slots to 0 or 0xFF)
+    for (uint8_t i = 0; i < 8; i++) {
+        if (i < active_tracker_count) {
+            req.active_tracker_ids[i] = active_tracker_ids[i];
+        } else {
+            req.active_tracker_ids[i] = 0xFF; // Padding
+        }
+    }
     
-    // 2. Read Linear Acceleration
-    imu::Vector<3> linAcc = bno.getVector(Adafruit_BNO055::VECTOR_LINEARACCEL);
-
-    // DEBUG: Print to Serial to verify sensor is working locally
-    // If these are zero, your sensor is not calibrating or wiring is loose.
-    // Serial.printf("Q: %.2f %.2f %.2f %.2f\n", quat.w(), quat.x(), quat.y(), quat.z());
-
-    // 3. Pack Data into the mandatory struct
-    IMUPacket pkt;
-
-    // Ensure types match common.h (float)
-    pkt.w = (float)quat.w();
-    pkt.x = (float)quat.x();
-    pkt.y = (float)quat.y();
-    pkt.z = (float)quat.z();
-
-    pkt.ax = (float)linAcc.x();
-    pkt.ay = (float)linAcc.y();
-    pkt.az = (float)linAcc.z();
-
-    pkt.tracker_id = DEVICE_ID;
-
-    // 4. Send over UDP
-    // If you strictly want BROADCAST (to all PCs), use:
-    // udp.beginPacket(IPAddress(255,255,255,255), TARGET_PORT);
-    // Otherwise, use the PC_IP from secrets:
-    udp.beginPacket(PC_IP, TARGET_PORT);
-    udp.write((uint8_t*)&pkt, sizeof(pkt));
+    // Broadcast to the subnet to auto-discover the PC
+    IPAddress broadcastIp = IPAddress(255, 255, 255, 255);
+    udp.beginPacket(broadcastIp, TARGET_PORT);
+    udp.write((uint8_t*)&req, sizeof(HandshakeReqPacket));
     udp.endPacket();
+    
+    Serial.println("Broadcasted Handshake Request...");
+}
+
+void sendIMUData() {
+    if (!is_ip_known) return;
+
+    for (uint8_t i = 0; i < active_tracker_count; i++) {
+        uint8_t id = active_tracker_ids[i];
+        
+        myMux.setPort(id); // Rapidly select the I2C channel for this sensor
+        
+        imu::Quaternion quat = bno[id].getQuat();
+        imu::Vector<3> linAcc = bno[id].getVector(Adafruit_BNO055::VECTOR_LINEARACCEL);
+
+        IMUPacket pkt;
+        pkt.packet_type = PACKET_IMU_DATA;
+        pkt.imu_id = id;
+        pkt.w = (float)quat.w();
+        pkt.x = (float)quat.x();
+        pkt.y = (float)quat.y();
+        pkt.z = (float)quat.z();
+        pkt.ax = (float)linAcc.x();
+        pkt.ay = (float)linAcc.y();
+        pkt.az = (float)linAcc.z();
+
+        udp.beginPacket(pc_ip, TARGET_PORT);
+        udp.write((uint8_t*)&pkt, sizeof(IMUPacket));
+        udp.endPacket();
+    }
 }
